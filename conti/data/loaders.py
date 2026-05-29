@@ -65,6 +65,13 @@ _BUNDLED_SAFETY_SETS = {
     "donotanswer_subset": "donotanswer_subset.jsonl",
 }
 
+# Full datasets from HuggingFace for proper baselines
+_HF_SAFETY_SETS = {
+    "advbench_full": {"repo": "walledai/AdvBench", "split": "train", "key": "prompt"},
+    "xstest_full": {"repo": "walledai/XSTest", "split": "test", "key": "prompt"},
+    "donotanswer_full": {"repo": "LibrAI/do-not-answer", "split": "train", "key": "question"},
+}
+
 
 def load_safety_prompts(
     name: str,
@@ -75,7 +82,20 @@ def load_safety_prompts(
         raw = _read_packaged_jsonl(_BUNDLED_SAFETY_SETS[name])
         return _parse_jsonl_prompts(raw, key="prompt", max_n=max_samples)
 
-    # not bundled, try huggingface
+    # full HF datasets for proper baselines
+    if name in _HF_SAFETY_SETS:
+        info = _HF_SAFETY_SETS[name]
+        ds = load_dataset(info["repo"], split=info["split"])
+        out: list[str] = []
+        for i, row in enumerate(ds):
+            if i >= max_samples:
+                break
+            p = row.get(info["key"]) or row.get("prompt") or row.get("text") or row.get("instruction")
+            if p:
+                out.append(str(p))
+        return out
+
+    # not bundled, try huggingface generically
     ds = load_dataset(name, split="train")
     out: list[str] = []
     for i, row in enumerate(ds):

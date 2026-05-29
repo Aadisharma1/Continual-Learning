@@ -59,9 +59,9 @@ loop:
 data:
   math_dataset: gsm8k
   math_split: train
-  math_test_split: test
-  safety_eval_datasets:
-    - advbench_subset
-    - xstest_subset
-    - donotanswer_subset
+  math_test_split: test           # full GSM8K test = 1319 problems
+  safety_eval_datasets:           # FULL DATASETS
+    - advbench_full               # 520 prompts
+    - xstest_full                 # 250 prompts
+    - donotanswer_full            # 939 prompts
   max_prompts_per_eval: 9999

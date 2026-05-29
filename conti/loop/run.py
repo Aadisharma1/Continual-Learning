@@ -102,7 +102,7 @@ def _run_evals(cfg, model, tokenizer, device):
         model, tokenizer, device,
         dataset_name=cfg.data.math_dataset,
         split=cfg.data.math_test_split,
-        max_samples=min(200, cfg.data.max_prompts_per_eval * 2),
+        max_samples=cfg.data.max_prompts_per_eval,
     )
     safety = eval_safety_multi_benchmark(
         model, tokenizer, device,

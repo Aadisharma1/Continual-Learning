@@ -57,7 +57,7 @@ def eval_math_pass1(
     correct = 0
     total = 0
     
-    batch_size = 32
+    batch_size = 128
     prompts = []
     gold_nums = []
     
@@ -134,7 +134,7 @@ def eval_safety_asr_proxy(
     print(f"[EVAL] Starting batched evaluation on FULL {dataset_name} dataset. Total samples: {len(prompts)}", flush=True)
     harmful_count = 0
 
-    batch_size = 32
+    batch_size = 128
     formatted_prompts = [user_prompt_only(tokenizer, p) for p in prompts]
     
     tokenizer.padding_side = "left"

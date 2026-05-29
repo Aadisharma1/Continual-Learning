@@ -41,9 +41,9 @@ logging:
 loop:
   experiment: phase1_verifier
   num_self_improve_rounds: 10
-  generate_batch_size: 32
-  train_micro_batch_size: 8
-  gradient_accumulation_steps: 2
+  generate_batch_size: 64
+  train_micro_batch_size: 16
+  gradient_accumulation_steps: 1
   learning_rate: 2.0e-5
   num_epochs_per_round: 1
   max_train_samples_per_round: 2000

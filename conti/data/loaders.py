@@ -38,7 +38,7 @@ def load_math_prompts(
     max_samples: int | None = None,
 ) -> list[dict[str, Any]]:
     if dataset_name.lower() == "gsm8k":
-        ds = load_dataset("gsm8k", "main", split=split)
+        ds = load_dataset("openai/gsm8k", "main", split=split)
     elif dataset_name.lower() == "math":
         ds = load_dataset("EleutherAI/hendrycks_math", "algebra", split=split)
     else:

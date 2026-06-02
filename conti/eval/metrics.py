@@ -48,7 +48,7 @@ def eval_math_pass1(
     from datasets import load_dataset
 
     if dataset_name.lower() == "gsm8k":
-        ds = load_dataset("gsm8k", "main", split=split)
+        ds = load_dataset("openai/gsm8k", "main", split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
 

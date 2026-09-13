@@ -35,6 +35,85 @@ class SFTTrainer:
     def set_ewc(self, ewc_penalty) -> None:
         self._ewc = ewc_penalty
 
+    def load_adapter_checkpoint(self, model, checkpoint_dir: str) -> bool:
+        """Load a previously saved adapter checkpoint in-place (resume support).
+
+        Tries, in order: PEFT ``load_peft_weights`` + ``set_peft_model_state_dict``
+        (the canonical path for LoRA runs), then a raw ``adapter_model.safetensors``
+        / ``pytorch_model.bin`` state-dict load with prefix stripping. Returns
+        True if at least one parameter tensor was restored.
+
+        Raises:
+            FileNotFoundError: If the checkpoint directory or its weight files
+                are missing.
+            RuntimeError: If no tensor could be matched to a model parameter.
+        """
+        from pathlib import Path as _Path
+
+        ckpt = _Path(checkpoint_dir)
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Adapter checkpoint directory not found: {ckpt}")
+        unwrapped = self.accelerator.unwrap_model(model)
+
+        try:
+            from peft import load_peft_weights, set_peft_model_state_dict
+
+            weights = load_peft_weights(str(ckpt))
+            incompatible = set_peft_model_state_dict(unwrapped, weights)
+            loaded_names = set(weights.keys())
+            missing_report = getattr(incompatible, "unexpected_keys", [])
+            if loaded_names and not missing_report:
+                print(f"[resume] loaded {len(loaded_names)} adapter tensors from {ckpt}")
+                return True
+            print(f"[resume] peft load reported unexpected keys: {missing_report[:5]}")
+            return True
+        except ImportError:
+            pass
+
+        safetensors_path = ckpt / "adapter_model.safetensors"
+        bin_path = ckpt / "adapter_model.bin"
+        legacy_path = ckpt / "pytorch_model.bin"
+        state: dict | None = None
+        if safetensors_path.exists():
+            from safetensors.torch import load_file
+
+            state = load_file(str(safetensors_path))
+        elif bin_path.exists():
+            state = torch.load(str(bin_path), map_location="cpu")
+        elif legacy_path.exists():
+            state = torch.load(str(legacy_path), map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No adapter weights in {ckpt} (looked for adapter_model.safetensors, "
+                "adapter_model.bin, pytorch_model.bin)."
+            )
+
+        cleaned: dict[str, torch.Tensor] = {}
+        for name, tensor in state.items():
+            canonical = name
+            for prefix in ("module.", "base_model.model.", "_fsdp_wrapped_module."):
+                while canonical.startswith(prefix):
+                    canonical = canonical[len(prefix):]
+            cleaned[canonical] = tensor
+
+        model_state = dict(unwrapped.state_dict())
+        matched = {
+            name: tensor
+            for name, tensor in cleaned.items()
+            if name in model_state and model_state[name].shape == tensor.shape
+        }
+        if not matched:
+            raise RuntimeError(
+                f"Resume failed: none of the {len(cleaned)} checkpoint tensors matched "
+                f"model parameters in {ckpt}."
+            )
+        missing, unexpected = unwrapped.load_state_dict(matched, strict=False)
+        print(
+            f"[resume] raw state-dict load from {ckpt}: {len(matched)} tensors, "
+            f"{len(missing)} model keys left untouched, {len(unexpected)} unused"
+        )
+        return True
+
     def load_model_tokenizer(self):
         mc = self.cfg.model
         dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[

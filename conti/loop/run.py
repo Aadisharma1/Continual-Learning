@@ -1,273 +1,554 @@
+"""Multi-round STaR + latent filter experiment loop.
+
+Orchestrates the full iterative self-improvement pipeline over an aligned
+Instruct checkpoint:
+
+1. Baseline initialization: LoRA attach, frozen Round-0 evaluation (full
+   benchmarks), baseline safety Fisher ``F_0`` over refusal data, baseline
+   residual-stream capture and safety gradient anchor.
+2. Dual gating per round: math-correctness verification (exact numeric match)
+   plus Gate R (:class:`conti.loop.subliminal_filter.SubliminalFilter`) on the
+   conditions that use it.
+3. Training under one of four experimental conditions:
+
+   * ``star_only``       -- correctness filtering only (pathology arm).
+   * ``safety_replay``   -- Gate R + minimal safety replay mixed per batch.
+   * ``ewc_regularized`` -- Gate R + true EWC penalty from ``F_0``.
+   * ``bianchi_control`` -- single-shot static tuning at Round 0 with a fixed
+     safety fraction (Bianchi et al. 2023 recipe); no further training rounds.
+
+4. Per-round JSONL logging to ``logs/round_metrics.jsonl``,
+   ``logs/drift_log.jsonl`` and ``logs/latent_filter.jsonl``.
+
+Distribution: runs under ``torchrun``/Accelerate. Generation is sharded across
+ranks and re-assembled via object gather; training text lists are broadcast so
+every rank trains on identical data (DDP-averaged gradients). Gate-R and Fisher
+computations are performed redundantly on every rank over identical data so no
+cross-rank synchronization of large gradient/Fisher states is required.
+"""
+
 from __future__ import annotations
 
 import json
-import re
+import logging
+import time
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
-from importlib import resources
-
-from accelerate.utils import broadcast_object_list
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from conti.config_schema import ContiConfig
+from conti.data.loaders import load_math_prompts
 from conti.eval.drift import DriftTracker
-from conti.eval.metrics import eval_math_pass1, eval_safety_asr_proxy, eval_safety_multi_benchmark
-from conti.logging import ExperimentLogger
+from conti.eval.metrics import (
+    DatasetCountError,
+    eval_math_pass1,
+    eval_safety_disentangled,
+    generate_batch,
+    is_correct_prediction,
+)
+from conti.loop.subliminal_filter import SubliminalFilter, make_probe_batches
 from conti.replay.buffer import SafetyReplayBuffer
-from conti.reproducibility import RunManifest, build_manifest, set_global_seed
+from conti.reproducibility import build_manifest, set_global_seed
+from conti.training.ewc import (
+    EWCPenaltyLoss,
+    EmpiricalFisherEstimator,
+    SafetyTextDataset,
+    make_fisher_collate,
+)
 from conti.training.sft import SFTTrainer
-from conti.verifier.keyword import KeywordVerifier, CompositeVerifier
-# pulling helpers from utils instead of navigating 5 nested folders
-from utils import load_math_prompts, build_supervised_example, replay_item_to_text, user_prompt_only
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_CONDITIONS = (
+    "baseline_frozen",
+    "star_only",
+    "safety_replay",
+    "ewc_regularized",
+    "bianchi_control",
+)
+GATE_R_CONDITIONS = ("safety_replay", "ewc_regularized")
+
+_BENCHMARK_ALIASES = {
+    "advbench": "advbench",
+    "adv_bench": "advbench",
+    "xstest": "xstest",
+    "donotanswer": "donotanswer",
+    "do_not_answer": "donotanswer",
+    "dna": "donotanswer",
+}
 
 
-def _broadcast_texts(accelerator, texts: list[str] | None) -> list[str]:
-    if accelerator.num_processes <= 1:
-        return texts or []
-    payload = [texts if accelerator.is_main_process else None]
-    broadcast_object_list(payload, from_process=0)
-    return payload[0] or []
+def _normalize_benchmark_names(raw: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for name in raw:
+        key = str(name).lower().replace("_subset", "").replace("_full", "")
+        if key not in _BENCHMARK_ALIASES:
+            raise ValueError(
+                f"Unknown safety benchmark '{name}'. Supported: advbench, xstest, donotanswer."
+            )
+        canonical = _BENCHMARK_ALIASES[key]
+        if canonical not in normalized:
+            normalized.append(canonical)
+    if not normalized:
+        raise ValueError("safety_eval_datasets resolved to an empty benchmark list.")
+    return tuple(normalized)
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+def _find_resume_round(out_dir: Path) -> int:
+    """Highest round whose checkpoint directory contains a completed ``.done`` sentinel.
+
+    A checkpoint dir without ``.done`` (e.g. a crashed save) is ignored, so a
+    resume always restarts from a fully persisted round.
+    """
+    checkpoints_root = out_dir / "checkpoints"
+    if not checkpoints_root.exists():
+        return -1
+    highest = -1
+    for child in checkpoints_root.iterdir():
+        if child.is_dir() and (child / ".done").exists():
+            try:
+                round_index = int(child.name.split("_")[-1])
+            except ValueError:
+                continue
+            highest = max(highest, round_index)
+    return highest
+
+
+# --------------------------------------------------------------------------- #
+# small IO / distribution helpers
+# --------------------------------------------------------------------------- #
+
+
+def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
-def _extract_num(text: str) -> str | None:
-    nums = re.findall(r"[-+]?\d*\.?\d+", text.replace(",", ""))
-    # print(f"DEBUG: extracted num {nums[-1] if nums else None}")  # sanity check during eval
-    return nums[-1] if nums else None
+def _broadcast_object(accelerator, obj: Any) -> Any:
+    if accelerator.num_processes <= 1:
+        return obj
+    from accelerate.utils import broadcast_object_list
+
+    payload = [obj if accelerator.is_main_process else None]
+    broadcast_object_list(payload, from_process=0)
+    return payload[0]
 
 
-def _extract_gold_num(gold: str | None) -> str | None:
-    if not gold:
-        return None
-    m = re.search(r"####\s*([-+]?[\d,]+)", gold)
-    if m:
-        return m.group(1).replace(",", "")
-    return _extract_num(gold)
+def _gather_objects(accelerator, obj: Any) -> list[Any]:
+    if accelerator.num_processes <= 1:
+        return [obj]
+    import torch.distributed as dist
+
+    gathered: list[Any] = [None] * accelerator.num_processes
+    dist.all_gather_object(gathered, obj)
+    return gathered
 
 
-def _is_correct(generated: str, gold: str | None) -> bool:
-    g = _extract_gold_num(gold)
-    p = _extract_num(generated)
-    if g is None or p is None:
-        return False
-    return p.replace(".", "") == g.replace(".", "")
+def _resolve_safety_jsonl(cfg: ContiConfig) -> Path:
+    if cfg.replay.dataset_path:
+        path = Path(cfg.replay.dataset_path)
+        if not path.exists():
+            raise FileNotFoundError(f"replay.dataset_path does not exist: {path}")
+        return path
+    try:
+        traversable = resources.files("conti.data").joinpath("safety_replay.jsonl")
+    except (ModuleNotFoundError, TypeError) as exc:  # pragma: no cover - packaging edge
+        raise FileNotFoundError(
+            "No replay.dataset_path configured and packaged conti/data/safety_replay.jsonl "
+            f"could not be located: {exc}"
+        ) from exc
+    return Path(str(traversable))
 
 
-def _validate_protocol(cfg: ContiConfig) -> None:
-    exp = cfg.loop.experiment
-    if exp == "baseline_single_sft" and cfg.loop.num_self_improve_rounds != 1:
-        raise ValueError("baseline_single_sft must run exactly 1 round")  # ek hi round chalega bhai
-    if exp != "phase2_verifier_buffer" and cfg.replay.enabled:
-        raise ValueError("replay buffer only for phase2_verifier_buffer")
-    if exp == "phase2_verifier_buffer" and not cfg.replay.enabled:
-        raise ValueError("phase2_verifier_buffer needs replay.enabled=true")
+def _format_generation_prompt(tokenizer: Any, question: str) -> str:
+    chat = getattr(tokenizer, "apply_chat_template", None)
+    if callable(chat):
+        try:
+            return str(
+                chat(
+                    [{"role": "user", "content": question}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to plain prompt
+            logger.warning("apply_chat_template failed (%s); using plain prompt.", exc)
+    return f"{question}\n\nAnswer:"
 
 
-@torch.inference_mode()
-def _gen_batch(model, tokenizer, questions, max_new_tokens, device, temp, top_p):
-    texts = [user_prompt_only(tokenizer, q) for q in questions]
-    max_in = min(2048, getattr(tokenizer, "model_max_length", 2048) or 2048)
-    enc = tokenizer(texts, padding=True, return_tensors="pt", truncation=True, max_length=max_in)
-    # print(enc["input_ids"].shape)  # taking up too much VRAM? check this
-    enc = {k: v.to(device) for k, v in enc.items()}
-    out = model.generate(
-        **enc,
-        max_new_tokens=max_new_tokens, do_sample=True,
-        top_p=top_p, temperature=temp,
-        pad_token_id=tokenizer.pad_token_id,
+def _format_supervised_text(tokenizer: Any, question: str, response: str) -> str:
+    chat = getattr(tokenizer, "apply_chat_template", None)
+    eos = getattr(tokenizer, "eos_token", "") or ""
+    if callable(chat):
+        try:
+            return str(
+                chat(
+                    [
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": response},
+                    ],
+                    tokenize=False,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apply_chat_template failed (%s); using plain concatenation.", exc)
+    return f"{question}\n\nAnswer:{response}{eos}"
+
+
+def _replay_item_to_text(tokenizer: Any, item: Mapping[str, Any]) -> str:
+    if "prompt" in item and "response" in item:
+        return _format_supervised_text(tokenizer, str(item["prompt"]), str(item["response"]))
+    if "text" in item:
+        return str(item["text"])
+    raise ValueError(f"Replay item has neither prompt/response nor text: keys={sorted(item.keys())}")
+
+
+def _safety_scores_for_drift(safety_results: Mapping[str, Any]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for name, benchmark in safety_results.items():
+        if name == "aggregate_unsafe":
+            scores["aggregate"] = float(benchmark["asr"])
+            continue
+        if "unsafe" in benchmark:
+            scores[name] = float(benchmark["unsafe"]["asr"])
+        if "safe" in benchmark:
+            scores[f"{name}_safe_frr"] = float(benchmark["safe"]["false_refusal_rate"])
+    return scores
+
+
+def _move_batch_to(batch: Mapping[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    return {key: value.to(device) for key, value in batch.items() if isinstance(value, torch.Tensor)}
+
+
+def _make_fisher_batches(
+    safety_path: Path,
+    tokenizer: Any,
+    cfg: ContiConfig,
+    device: torch.device,
+    max_rows: int | None = None,
+) -> list[dict[str, torch.Tensor]]:
+    dataset = SafetyTextDataset(safety_path)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.ewc.fisher_batch_size,
+        shuffle=False,
+        collate_fn=make_fisher_collate(tokenizer, max_len=cfg.ewc.fisher_max_len),
+        num_workers=0,
     )
-    gen = []
-    for i, row in enumerate(out):
-        inp_len = int(enc["attention_mask"][i].sum())
-        gen.append(tokenizer.decode(row[inp_len:], skip_special_tokens=True).strip())
-    return gen
+    batches: list[dict[str, torch.Tensor]] = []
+    rows = 0
+    for batch in loader:
+        batches.append(_move_batch_to(batch, device))
+        rows += int(batch["input_ids"].shape[0])
+        if max_rows is not None and rows >= max_rows:
+            break
+    if not batches:
+        raise RuntimeError(f"Safety dataset at {safety_path} produced zero batches.")
+    return batches
 
 
-def _make_verifier(cfg: ContiConfig):
-    if cfg.verifier.mode == "keyword_and_model":
-        return CompositeVerifier(cfg.verifier)
-    return KeywordVerifier(cfg.verifier)
+# --------------------------------------------------------------------------- #
+# evaluation helpers
+# --------------------------------------------------------------------------- #
 
 
-def _run_evals(cfg, model, tokenizer, device):
-    math = eval_math_pass1(
-        model, tokenizer, device,
+def _run_full_evals(cfg: ContiConfig, model: Any, tokenizer: Any) -> dict[str, Any]:
+    math_result = eval_math_pass1(
+        model,
+        tokenizer,
         dataset_name=cfg.data.math_dataset,
         split=cfg.data.math_test_split,
-        max_samples=min(200, cfg.data.max_prompts_per_eval * 2),
+        batch_size=16,
+        max_new_tokens=cfg.loop.eval_max_new_tokens,
     )
-    safety = eval_safety_multi_benchmark(
-        model, tokenizer, device,
-        benchmark_names=cfg.data.safety_eval_datasets,
-        max_per_benchmark=cfg.data.max_prompts_per_eval,
+    safety_result = eval_safety_disentangled(
+        model,
+        tokenizer,
+        benchmark_names=_normalize_benchmark_names(cfg.data.safety_eval_datasets),
+        batch_size=16,
+        max_new_tokens=256,
     )
-    return {"math_pass1": math, "safety_asr": safety}
+    return {"math_pass1": math_result, "safety": safety_result}
 
 
-def _get_asr_scores(safety_results: dict) -> dict[str, float]:
-    return {
-        bench: r["asr_proxy"]
-        for bench, r in safety_results.items()
-        if isinstance(r, dict) and "asr_proxy" in r
-    }
+def _run_probe_evals(cfg: ContiConfig, model: Any, tokenizer: Any) -> dict[str, Any]:
+    math_result = eval_math_pass1(
+        model,
+        tokenizer,
+        dataset_name=cfg.data.math_dataset,
+        split=cfg.data.math_test_split,
+        batch_size=16,
+        max_new_tokens=cfg.loop.eval_max_new_tokens,
+        max_samples=cfg.loop.probe_eval_size,
+    )
+    safety_result = eval_safety_disentangled(
+        model,
+        tokenizer,
+        benchmark_names=_normalize_benchmark_names(cfg.data.safety_eval_datasets),
+        batch_size=16,
+        max_new_tokens=256,
+        max_samples_per_benchmark=min(100, cfg.loop.probe_eval_size),
+    )
+    return {"math_pass1": math_result, "safety": safety_result, "eval_mode": "probe"}
+
+
+# --------------------------------------------------------------------------- #
+# main loop
+# --------------------------------------------------------------------------- #
 
 
 def run_experiment(cfg: ContiConfig) -> None:
-    _validate_protocol(cfg)
+    """Execute a full multi-round experiment described by ``cfg``."""
+    if cfg.loop.experiment not in ALLOWED_CONDITIONS:
+        raise ValueError(
+            f"Unknown experiment '{cfg.loop.experiment}'. Allowed: {ALLOWED_CONDITIONS}"
+        )
+    condition = cfg.loop.experiment
     set_global_seed(cfg.seed)
-    out = Path(cfg.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = out_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest: RunManifest = build_manifest(cfg.to_dict(), cfg.seed)
-    manifest.save(out / "run_manifest.json")
+    manifest = build_manifest(cfg.to_dict(), cfg.seed)
+    manifest.save(out_dir / "run_manifest.json")
 
     from accelerate import Accelerator
 
-    acc = Accelerator(gradient_accumulation_steps=cfg.loop.gradient_accumulation_steps)
-    trainer = SFTTrainer(cfg=cfg, accelerator=acc)
-    logger = ExperimentLogger(cfg, run_dir=out)
-    drift = DriftTracker()  # har round ke baad check karenge kitna safety gira
+    accelerator = Accelerator(gradient_accumulation_steps=cfg.loop.gradient_accumulation_steps)
+    world_size = accelerator.num_processes
+    device = accelerator.device
+    logger.info("condition=%s world_size=%d device=%s", condition, world_size, device)
 
-    # baseline_frozen: evaluate only
-    if cfg.loop.experiment == "baseline_frozen":
-        model, tokenizer = trainer.load_model_tokenizer()
-        model = trainer.ensure_model_prepared(model)
-        model.eval()
-        if acc.is_main_process:
-            metrics = _run_evals(cfg, model, tokenizer, acc.device)
-            (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-            drift.set_baseline(_get_asr_scores(metrics.get("safety_asr", {})))
-        logger.finish()  # bas evaluate karo, kuch train mat karo
-
-        return
-
+    trainer = SFTTrainer(cfg=cfg, accelerator=accelerator)
     model, tokenizer = trainer.load_model_tokenizer()
-    verifier = _make_verifier(cfg)
+    generation_model = accelerator.unwrap_model(model)
 
-    replay_path = cfg.replay.dataset_path
-    if replay_path is None:
-        replay_path = resources.files("conti.data") / "safety_replay.jsonl"
-    replay_buf = SafetyReplayBuffer(replay_path, cfg.seed)
-    if not cfg.replay.enabled:
-        replay_buf = SafetyReplayBuffer(None, cfg.seed)
+    safety_path = _resolve_safety_jsonl(cfg)
+    replay_buf = SafetyReplayBuffer(safety_path, cfg.seed)
 
-    # ewc setup if needed
-    if cfg.ewc.enabled:
-        from conti.training.ewc import EWCPenalty
-        ewc = EWCPenalty(model, lambda_ewc=cfg.ewc.lambda_ewc)
-        # TODO: actually compute fisher on safety data.. need dataloader for that
-        trainer.set_ewc(ewc)
+    # ---------------- Round -1: frozen baseline state ----------------------- #
+    model_for_eval = generation_model
+    baseline_metrics = _run_full_evals(cfg, model_for_eval, tokenizer)
+    if accelerator.is_main_process:
+        _append_jsonl(
+            logs_dir / "round_metrics.jsonl",
+            {"round": -1, "condition": condition, **baseline_metrics, "eval_mode": "full"},
+        )
+    drift = DriftTracker()
+    drift.set_baseline(_safety_scores_for_drift(baseline_metrics["safety"]))
 
-    math_items = load_math_prompts(
-        cfg.data.math_dataset, cfg.data.math_split,
-        max_samples=cfg.loop.max_train_samples_per_round,
+    # baseline Fisher F_0 (identical data/seed on every rank -> identical state)
+    fisher_batches = _make_fisher_batches(
+        safety_path, tokenizer, cfg, device, max_rows=cfg.ewc.fisher_samples
+    )
+    fisher_estimator = EmpiricalFisherEstimator(
+        generation_model,
+        grad_clip=cfg.ewc.fisher_grad_clip,
+        eps=cfg.ewc.fisher_eps,
+        store_device=cfg.ewc.fisher_store_device,
+    )
+    fisher_baseline = fisher_estimator.compute_fisher(fisher_batches)
+    ref_params_baseline = {
+        name: param.detach().clone()
+        for name, param in generation_model.named_parameters()
+        if param.requires_grad
+    }
+
+    subliminal = SubliminalFilter(
+        generation_model,
+        layer_indices=cfg.subliminal.layer_indices,
+        tau_drift=cfg.subliminal.tau_drift,
+        store_device=cfg.ewc.fisher_store_device,
+    )
+    subliminal.set_baseline_fisher(fisher_baseline)
+
+    probe_prompts = [
+        str(item.get("prompt", item.get("text", "")))
+        for item in replay_buf.sample(cfg.subliminal.probe_samples)
+    ]
+    probe_prompts = [p for p in probe_prompts if p]
+    if not probe_prompts:
+        raise RuntimeError("Replay buffer produced zero probe prompts; cannot initialize Gate R.")
+    probe_batches_cpu = make_probe_batches(
+        tokenizer, probe_prompts, max_len=cfg.subliminal.probe_max_len
+    )
+    probe_batches = [_move_batch_to(b, device) for b in probe_batches_cpu]
+    subliminal.capture_baseline_representations(probe_batches)
+
+    anchor_batches = fisher_batches[: max(1, cfg.subliminal.anchor_samples // cfg.ewc.fisher_batch_size)]
+    subliminal.capture_safety_anchor(
+        anchor_batches, grad_clip=cfg.subliminal.grad_clip, max_samples=cfg.subliminal.anchor_samples
     )
 
-    # get baseline scores before we touch anything
-    if acc.is_main_process:
-        m = trainer.ensure_model_prepared(model)
-        m.eval()
-        base_metrics = _run_evals(cfg, m, tokenizer, acc.device)
-        drift.set_baseline(_get_asr_scores(base_metrics.get("safety_asr", {})))
-        logger.log_round(-1, {"baseline": base_metrics})
+    if condition == "ewc_regularized":
+        ewc_penalty = EWCPenaltyLoss(
+            fisher_baseline, ref_params_baseline, lambda_ewc=cfg.ewc.lambda_ewc
+        )
+        trainer.set_ewc(ewc_penalty)
 
-    filt_log: list[dict[str, Any]] = []
-    rnd_metrics: list[dict[str, Any]] = []
-    sup_rounds: list[list[str]] = []
+    if condition == "baseline_frozen":
+        if accelerator.is_main_process:
+            (out_dir / "metrics.json").write_text(
+                json.dumps({"baseline": baseline_metrics}, indent=2, default=str),
+                encoding="utf-8",
+            )
+        accelerator.wait_for_everyone()
+        return
 
-    for ri in range(cfg.loop.num_self_improve_rounds):
-        if cfg.loop.experiment == "baseline_single_sft" and ri > 0:
-            break
+    math_items = load_math_prompts(
+        cfg.data.math_dataset,
+        cfg.data.math_split,
+        max_samples=cfg.loop.max_train_samples_per_round,
+    )
+    if not math_items:
+        raise RuntimeError("load_math_prompts returned zero training prompts.")
+    num_rounds = cfg.loop.num_self_improve_rounds
+    full_eval_rounds = set(
+        cfg.loop.full_eval_rounds if cfg.loop.full_eval_rounds is not None else {num_rounds - 1}
+    )
 
-        rnd_texts: list[str] = []
-        bs = cfg.loop.generate_batch_size
-        rej_correct = 0
+    resume_round = _find_resume_round(out_dir) if cfg.loop.resume else -1
+    if resume_round >= 0:
+        trainer.load_adapter_checkpoint(model, str(out_dir / "checkpoints" / f"round_{resume_round}"))
+        logger.info(
+            "Resume: found completed round %d; rounds 0..%d will be skipped.", resume_round, resume_round
+        )
 
-        if cfg.loop.experiment == "baseline_single_sft":
-            if acc.is_main_process:
-                rnd_texts = _make_static_sft(tokenizer, math_items)
+    # ---------------- multi-round self-improvement -------------------------- #
+    for round_index in range(num_rounds):
+        if round_index <= resume_round:
+            continue
+        round_started = time.time()
+        shard = math_items[round_index::world_size]
+        generated: list[dict[str, Any]] = []
+        for start in tqdm(
+            range(0, len(shard), cfg.loop.generate_batch_size),
+            desc=f"gen r{round_index}",
+            disable=not accelerator.is_local_main_process,
+            leave=False,
+        ):
+            chunk = shard[start: start + cfg.loop.generate_batch_size]
+            prompts = [_format_generation_prompt(tokenizer, item["question"]) for item in chunk]
+            responses = generate_batch(
+                generation_model,
+                tokenizer,
+                prompts,
+                max_new_tokens=cfg.loop.generation_max_new_tokens,
+                do_sample=True,
+                temperature=cfg.loop.generation_temperature,
+                top_p=cfg.loop.generation_top_p,
+            )
+            for item, response in zip(chunk, responses):
+                generated.append(
+                    {
+                        "id": item["id"],
+                        "question": item["question"],
+                        "gold": item.get("answer"),
+                        "response": response,
+                    }
+                )
+        accelerator.wait_for_everyone()
+        candidates: list[dict[str, Any]] = []
+        for rank_payload in _gather_objects(accelerator, generated):
+            candidates.extend(rank_payload)
+        candidates = sorted(candidates, key=lambda c: str(c["id"]))
+
+        correct_pass: list[dict[str, Any]] = []
+        rejected_correct = 0
+        if cfg.loop.require_correct_trajectory:
+            for candidate in candidates:
+                if is_correct_prediction(candidate["response"], candidate["gold"]):
+                    correct_pass.append(candidate)
+                else:
+                    rejected_correct += 1
         else:
-            mdl = trainer.ensure_model_prepared(model)
-            dev = acc.device
-            mdl.eval()
+            correct_pass = list(candidates)
 
-            pend_q: list[str] = []
-            pend_m: list[dict[str, Any]] = []
-
-            def flush():
-                nonlocal rnd_texts, pend_q, pend_m, rej_correct
-                if not pend_q or not acc.is_main_process:
-                    return
-                qs, meta = pend_q, pend_m
-                pend_q, pend_m = [], []
-
-                gens = _gen_batch(
-                    mdl, tokenizer, qs,
-                    max_new_tokens=min(cfg.loop.generation_max_new_tokens, cfg.model.max_seq_length // 2),
-                    device=dev, temp=cfg.loop.generation_temperature,
-                    top_p=cfg.loop.generation_top_p,
+        gate_rejected = 0
+        gate_rows: list[dict[str, Any]] = []
+        accepted_candidates = correct_pass
+        if condition in GATE_R_CONDITIONS and correct_pass:
+            gate_device_batches: list[dict[str, torch.Tensor]] = []
+            for start in range(0, len(correct_pass), cfg.loop.generate_batch_size):
+                chunk = correct_pass[start: start + cfg.loop.generate_batch_size]
+                texts = [
+                    _format_supervised_text(tokenizer, c["question"], c["response"])
+                    for c in chunk
+                ]
+                encoded = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=cfg.model.max_seq_length,
                 )
-                for q, g, m in zip(qs, gens, meta, strict=True):
-                    if cfg.loop.require_correct_trajectory:
-                        if not _is_correct(g, m.get("gold_answer")):
-                            rej_correct += 1
-                            continue
-
-                    use_v = cfg.loop.experiment in ("phase1_verifier", "phase2_verifier_buffer")
-                    if use_v:
-                        v = verifier.check_text(g)
-                        filt_log.append({
-                            "round": ri, "id": m["id"],
-                            "safe": v.safe, "reason": v.reason,
-                        })
-                        if not v.safe:
-                            continue
-
-                    rnd_texts.append(build_supervised_example(tokenizer, q, g))
-
-            it = tqdm(math_items, desc=f"gen r{ri}") if acc.is_main_process else math_items
-            for item in it:
-                if acc.is_main_process:
-                    pend_q.append(item["question"])
-                    pend_m.append({"id": item["id"], "gold_answer": item.get("answer")})
-                    if len(pend_q) >= bs:
-                        flush()
-            if acc.is_main_process:
-                flush()
-
-            # phase2: mix in replay buffer
-            if cfg.loop.experiment == "phase2_verifier_buffer" and cfg.replay.enabled and len(replay_buf):
-                n = min(
-                    cfg.replay.safety_samples_per_batch * max(1, len(rnd_texts) // max(1, bs)),
-                    len(replay_buf),
+                labels = encoded["input_ids"].clone()
+                labels.masked_fill_(encoded["attention_mask"] == 0, -100)
+                encoded["labels"] = labels
+                gate_device_batches.append(_move_batch_to(dict(encoded), device))
+            grad_results = subliminal.gradient_alignment_test(
+                gate_device_batches,
+                tau_drift=cfg.subliminal.tau_drift,
+                grad_clip=cfg.subliminal.grad_clip,
+            )
+            kept: list[dict[str, Any]] = []
+            for candidate, grad_result in zip(correct_pass, grad_results):
+                gate_rows.append(
+                    {
+                        "round": round_index,
+                        "item_id": candidate["id"],
+                        "cosine": grad_result["cosine"],
+                        "accepted": grad_result["accepted"],
+                        "reason": grad_result["reason"],
+                    }
                 )
-                if acc.is_main_process:
-                    for ex in replay_buf.sample(n):
-                        try:
-                            rnd_texts.append(replay_item_to_text(tokenizer, ex))
-                        except (ValueError, KeyError, TypeError):
-                            continue
+                if grad_result["accepted"]:
+                    kept.append(candidate)
+                else:
+                    gate_rejected += 1
+            accepted_candidates = kept
+        if accelerator.is_main_process:
+            for row in gate_rows:
+                _append_jsonl(logs_dir / "latent_filter.jsonl", row)
 
-        rnd_texts = _broadcast_texts(acc, rnd_texts)
-        sup_rounds.append(rnd_texts)
-        accepted = len(rnd_texts)
+        train_texts = [
+            _format_supervised_text(tokenizer, c["question"], c["response"])
+            for c in accepted_candidates
+        ]
 
-        rej_safety = 0
-        if cfg.loop.experiment in ("phase1_verifier", "phase2_verifier_buffer"):
-            rej_safety = sum(1 for x in filt_log if x["round"] == ri and not x["safe"])
+        static_mix_count = 0
+        if condition == "bianchi_control":
+            if round_index == 0:
+                static_mix_count = max(1, int(cfg.replay.bianchi_safety_fraction * max(1, len(train_texts))))
+                for item in replay_buf.sample(static_mix_count):
+                    train_texts.append(_replay_item_to_text(tokenizer, item))
+            else:
+                train_texts = []
+        elif condition == "safety_replay" and cfg.replay.enabled and len(replay_buf) > 0:
+            num_batches = max(1, -(-len(train_texts) // max(1, cfg.loop.train_micro_batch_size)))
+            replay_count = min(
+                cfg.replay.safety_samples_per_batch * num_batches,
+                len(replay_buf),
+                max(0, len(train_texts) // 2),
+            )
+            for item in replay_buf.sample(replay_count):
+                train_texts.append(_replay_item_to_text(tokenizer, item))
 
-        # train
-        if cfg.loop.experiment in ("naive_continual", "phase1_verifier", "phase2_verifier_buffer", "baseline_single_sft"):
-            stats = trainer.train_on_texts(
-                model=model, tokenizer=tokenizer, texts=rnd_texts,
+        if world_size > 1:
+            train_texts = _broadcast_object(accelerator, train_texts)
+
+        training_stats: dict[str, list[float]] = {"loss": []}
+        if train_texts:
+            training_stats = trainer.train_on_texts(
+                model=model,
+                tokenizer=tokenizer,
+                texts=train_texts,
                 learning_rate=cfg.loop.learning_rate,
                 num_epochs=cfg.loop.num_epochs_per_round,
                 micro_batch_size=cfg.loop.train_micro_batch_size,
@@ -276,56 +557,90 @@ def run_experiment(cfg: ContiConfig) -> None:
                 max_seq_length=cfg.model.max_seq_length,
                 max_grad_norm=cfg.loop.max_grad_norm,
             )
+            checkpoint_dir = out_dir / "checkpoints" / f"round_{round_index}"
+            trainer.save_pretrained(model, tokenizer, str(checkpoint_dir))
+            (checkpoint_dir / ".done").write_text("ok\n", encoding="utf-8")
+        accelerator.wait_for_everyone()
 
-            ckpt = out / "checkpoints" / f"round_{ri}"
-            trainer.save_pretrained(trainer.ensure_model_prepared(model), tokenizer, str(ckpt))
+        eval_mode = "full" if round_index in full_eval_rounds else "probe"
+        if accelerator.is_main_process:
+            eval_results = (
+                _run_full_evals(cfg, model_for_eval, tokenizer)
+                if eval_mode == "full"
+                else _run_probe_evals(cfg, model_for_eval, tokenizer)
+            )
+            drift.record(round_index, _safety_scores_for_drift(eval_results["safety"]))
+            mean_loss = training_stats.get("loss", [])
+            round_row = {
+                "round": round_index,
+                "condition": condition,
+                "seed": cfg.seed,
+                "eval_mode": eval_mode,
+                "n_candidates": len(candidates),
+                "rej_correct": rejected_correct,
+                "rej_gate_r": gate_rejected,
+                "accepted": len(accepted_candidates),
+                "static_mix_count": static_mix_count,
+                "mean_train_loss": sum(mean_loss) / max(1, len(mean_loss)),
+                "wallclock_s": time.time() - round_started,
+                **eval_results,
+            }
+            _append_jsonl(logs_dir / "round_metrics.jsonl", round_row)
+            for benchmark, payload in drift.get_round_summary(round_index).items():
+                _append_jsonl(
+                    logs_dir / "drift_log.jsonl",
+                    {"round": round_index, "benchmark": benchmark, **payload},
+                )
 
-            if acc.is_main_process and stats:
-                for si, (loss, ewc_p) in enumerate(zip(stats.get("loss", []), stats.get("ewc_penalty", []))):
-                    logger.log_step({"loss": loss, "ewc_penalty": ewc_p}, step=ri * 10000 + si)
+        if (round_index + 1) % max(1, cfg.subliminal.fisher_every_n_rounds) == 0:
+            current_estimator = EmpiricalFisherEstimator(
+                generation_model,
+                grad_clip=cfg.ewc.fisher_grad_clip,
+                eps=cfg.ewc.fisher_eps,
+                store_device=cfg.ewc.fisher_store_device,
+            )
+            fisher_current = current_estimator.compute_fisher(
+                fisher_batches, max_samples=cfg.ewc.fisher_samples
+            )
+            subliminal.set_current_fisher(fisher_current)
+            curvature = subliminal.evaluate_refusal_curvature()
+            representation = subliminal.compute_representation_drift(probe_batches)
+            if accelerator.is_main_process:
+                _append_jsonl(
+                    logs_dir / "latent_filter.jsonl",
+                    {
+                        "round": round_index,
+                        "event": "latent_drift",
+                        "fisher_curvature_frobenius": curvature,
+                        "fisher_divergence": subliminal.last_curvature_details,
+                        "representation_drift": representation,
+                        "tau_drift": cfg.subliminal.tau_drift,
+                        "max_allowed_curvature": cfg.subliminal.max_allowed_curvature,
+                    },
+                )
+        accelerator.wait_for_everyone()
 
-        # eval
-        if cfg.loop.eval_every_round and acc.is_main_process:
-            model.eval()
-            ev = _run_evals(cfg, trainer.ensure_model_prepared(model), tokenizer, acc.device)
-            ev["round"] = ri
-            ev["accepted"] = accepted
-            ev["rej_verifier"] = rej_safety
-            ev["rej_correctness"] = rej_correct
-
-            cur_asrs = _get_asr_scores(ev.get("safety_asr", {}))
-            drift.record(ri, cur_asrs)
-            ev["drift"] = drift.get_round_summary(ri)
-
-            rnd_metrics.append(ev)
-            logger.log_round(ri, ev)
-            logger.log_drift(ri, ev.get("drift", {}))
-
-        acc.wait_for_everyone()
-
-    # save everything
-    if acc.is_main_process:
-        _write_jsonl(out / "logs" / "filter_log.jsonl", filt_log)
-        _write_jsonl(out / "logs" / "round_metrics.jsonl", rnd_metrics)
-        (out / "supervised_counts.json").write_text(
-            json.dumps([len(x) for x in sup_rounds]), encoding="utf-8",
+    # ---------------- final full evaluation -------------------------------- #
+    if accelerator.is_main_process:
+        final_metrics = _run_full_evals(cfg, model_for_eval, tokenizer)
+        (out_dir / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "condition": condition,
+                    "seed": cfg.seed,
+                    "final": final_metrics,
+                    "drift_summary": drift.to_summary_dict(),
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
         )
-        drift.save(out / "logs" / "drift_log.jsonl")
-
-        model.eval()
-        final = _run_evals(cfg, trainer.ensure_model_prepared(model), tokenizer, acc.device)
-        final["drift_summary"] = drift.to_summary_dict()
-        (out / "metrics.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
-
-    logger.finish()
+        _append_jsonl(
+            logs_dir / "round_metrics.jsonl",
+            {"round": num_rounds, "condition": condition, "eval_mode": "final", **final_metrics},
+        )
+    accelerator.wait_for_everyone()
 
 
-def _make_static_sft(tokenizer, math_items):
-    from datasets import load_dataset
-    ds = load_dataset("gsm8k", "main", split="train")
-    texts = []
-    for i, row in enumerate(ds):
-        if i >= len(math_items):
-            break
-        texts.append(build_supervised_example(tokenizer, row["question"].strip(), row["answer"].strip()))
-    return texts
+__all__ = ["run_experiment", "ALLOWED_CONDITIONS", "GATE_R_CONDITIONS", "DatasetCountError"]

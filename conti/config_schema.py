@@ -18,7 +18,7 @@ def _merge_dataclass(cls: type[T], overrides: dict[str, Any]) -> T:
 
 @dataclass
 class ModelConfig:
-    name_or_path: str = "meta-llama/Llama-3.1-8B-Instruct"
+    name_or_path: str = "meta-llama/Meta-Llama-3-8B-Instruct"
     torch_dtype: str = "bfloat16"
     trust_remote_code: bool = True
     use_lora: bool = True
@@ -49,6 +49,7 @@ class ReplayBufferConfig:
     enabled: bool = False
     safety_samples_per_batch: int = 4
     dataset_path: str | None = None
+    bianchi_safety_fraction: float = 0.03
 
 
 @dataclass
@@ -57,6 +58,25 @@ class EWCConfig:
     enabled: bool = False
     lambda_ewc: float = 5000.0  # treat as hyperparam
     fisher_samples: int = 200
+    fisher_grad_clip: float = 1.0
+    fisher_eps: float = 1e-8
+    fisher_store_device: str = "cpu"
+    fisher_batch_size: int = 2
+    fisher_max_len: int = 512
+
+
+@dataclass
+class SubliminalConfig:
+    """Gate R (latent drift / subliminal filter) settings."""
+    tau_drift: float = 0.0
+    anchor_samples: int = 32
+    probe_samples: int = 32
+    fisher_every_n_rounds: int = 2
+    max_allowed_curvature: float | None = None
+    cka_floor: float | None = None
+    layer_indices: list[int] | None = None
+    probe_max_len: int = 256
+    grad_clip: float = 1.0
 
 
 @dataclass
@@ -75,6 +95,10 @@ class LoopConfig:
         "naive_continual",
         "phase1_verifier",
         "phase2_verifier_buffer",
+        "star_only",
+        "safety_replay",
+        "ewc_regularized",
+        "bianchi_control",
     ] = "phase1_verifier"
     num_self_improve_rounds: int = 2
     generate_batch_size: int = 4
@@ -91,6 +115,10 @@ class LoopConfig:
     eval_every_round: bool = True
     require_correct_trajectory: bool = True
     max_grad_norm: float = 1.0
+    probe_eval_size: int = 300
+    full_eval_rounds: list[int] | None = None  # None -> only round 0 and final round are full
+    eval_max_new_tokens: int = 512
+    resume: bool = True  # relaunching the same command fast-forwards via .done sentinels
 
 
 @dataclass
@@ -99,7 +127,7 @@ class DataConfig:
     math_split: str = "train"
     math_test_split: str = "test"
     safety_eval_datasets: list[str] = field(
-        default_factory=lambda: ["advbench_subset", "xstest_subset", "donotanswer_subset"]
+        default_factory=lambda: ["advbench", "xstest", "donotanswer"]
     )
     max_prompts_per_eval: int = 100
 
@@ -112,6 +140,7 @@ class ContiConfig:
     verifier: VerifierConfig = field(default_factory=VerifierConfig)
     replay: ReplayBufferConfig = field(default_factory=ReplayBufferConfig)
     ewc: EWCConfig = field(default_factory=EWCConfig)
+    subliminal: SubliminalConfig = field(default_factory=SubliminalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -131,6 +160,7 @@ def dict_to_config(d: dict[str, Any]) -> ContiConfig:
     v = d.get("verifier") or {}
     r = d.get("replay") or {}
     e = d.get("ewc") or {}
+    sub = d.get("subliminal") or {}
     lg = d.get("logging") or {}
     lp = d.get("loop") or {}
     dt = d.get("data") or {}
@@ -141,6 +171,7 @@ def dict_to_config(d: dict[str, Any]) -> ContiConfig:
         verifier=_merge_dataclass(VerifierConfig, v),
         replay=_merge_dataclass(ReplayBufferConfig, r),
         ewc=_merge_dataclass(EWCConfig, e),
+        subliminal=_merge_dataclass(SubliminalConfig, sub),
         logging=_merge_dataclass(LoggingConfig, lg),
         loop=_merge_dataclass(LoopConfig, lp),
         data=_merge_dataclass(DataConfig, dt),

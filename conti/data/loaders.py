@@ -59,6 +59,12 @@ def load_math_prompts(
     return rows
 
 
+_FULL_SAFETY_MAP = {
+    "advbench_full": ("walledai/AdvBench", "train"),
+    "xstest_full": ("walledai/XSTest", "train"),
+    "donotanswer_full": ("LibrAI/do-not-answer", "train"),
+}
+
 _BUNDLED_SAFETY_SETS = {
     "advbench_subset": "advbench_subset.jsonl",
     "xstest_subset": "xstest_subset.jsonl",
@@ -71,17 +77,29 @@ def load_safety_prompts(
     max_samples: int,
     package_dir: Path | None = None,
 ) -> list[str]:
+    if name in _FULL_SAFETY_MAP:
+        repo, split = _FULL_SAFETY_MAP[name]
+        ds = load_dataset(repo, split=split)
+        out: list[str] = []
+        for i, row in enumerate(ds):
+            if i >= max_samples:
+                break
+            p = row.get("prompt") or row.get("text") or row.get("instruction") or row.get("question")
+            if p:
+                out.append(str(p))
+        return out
+
     if name in _BUNDLED_SAFETY_SETS:
         raw = _read_packaged_jsonl(_BUNDLED_SAFETY_SETS[name])
         return _parse_jsonl_prompts(raw, key="prompt", max_n=max_samples)
 
-    # not bundled, try huggingface
+    # fallback for other HF dataset names (e.g. legacy aliases)
     ds = load_dataset(name, split="train")
-    out: list[str] = []
+    out = []
     for i, row in enumerate(ds):
         if i >= max_samples:
             break
-        p = row.get("prompt") or row.get("text") or row.get("instruction")
+        p = row.get("prompt") or row.get("text") or row.get("instruction") or row.get("question")
         if p:
             out.append(str(p))
     return out

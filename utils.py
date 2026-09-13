@@ -41,8 +41,13 @@ def _parse_jsonl_prompts(raw_text: str, key: str = "prompt", max_n: int | None =
 
 
 def load_math_prompts(dataset_name: str, split: str, max_samples: int | None = None) -> list[dict[str, Any]]:
+    ds = None
     if dataset_name.lower() == "gsm8k":
-        ds = load_dataset("gsm8k", "main", split=split)
+        try:
+            ds = load_dataset("gsm8k", "main", split=split)
+        except Exception as e:
+            print(f"  [warn] gsm8k load_dataset failed ({e}), downloading raw JSONL...")
+            ds = _load_gsm8k_raw_fallback(split, max_samples)
     elif dataset_name.lower() == "math":
         ds = load_dataset("EleutherAI/hendrycks_math", "algebra", split=split)
     else:
@@ -61,6 +66,35 @@ def load_math_prompts(dataset_name: str, split: str, max_samples: int | None = N
             item["answer"] = str(answer).strip()
         rows.append(item)
     return rows
+
+
+def _load_gsm8k_raw_fallback(split: str, max_samples: int | None = None) -> list[dict]:
+    """Download GSM8K directly as JSONL — bypass broken datasets lib."""
+    import urllib.request
+    urls = {
+        "train": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/train.jsonl",
+        "test": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
+    }
+    url = urls.get(split, urls["train"])
+    import os
+    cache_dir = Path(os.environ.get("CONTI_GSM8K_CACHE", os.environ.get("SLURM_TMPDIR", "/tmp")))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"gsm8k_{split}.jsonl"
+    if not cache.exists():
+        print(f"  downloading GSM8K {split} from {url}...")
+        urllib.request.urlretrieve(url, cache)
+    items = []
+    with open(cache) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            items.append(row)
+            if max_samples and len(items) >= max_samples:
+                break
+    print(f"  loaded {len(items)} GSM8K items via raw fallback")
+    return items
 
 
 _BUNDLED_SAFETY_SETS = {

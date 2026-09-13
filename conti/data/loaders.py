@@ -38,7 +38,7 @@ def load_math_prompts(
     max_samples: int | None = None,
 ) -> list[dict[str, Any]]:
     if dataset_name.lower() == "gsm8k":
-        ds = load_dataset("gsm8k", "main", split=split)
+        ds = load_dataset("openai/gsm8k", "main", split=split)
     elif dataset_name.lower() == "math":
         ds = load_dataset("EleutherAI/hendrycks_math", "algebra", split=split)
     else:
@@ -69,6 +69,13 @@ _BUNDLED_SAFETY_SETS = {
     "advbench_subset": "advbench_subset.jsonl",
     "xstest_subset": "xstest_subset.jsonl",
     "donotanswer_subset": "donotanswer_subset.jsonl",
+}
+
+# Full datasets from HuggingFace for proper baselines
+_HF_SAFETY_SETS = {
+    "advbench_full": {"repo": "walledai/AdvBench", "split": "train", "key": "prompt"},
+    "xstest_full": {"repo": "walledai/XSTest", "split": "test", "key": "prompt"},
+    "donotanswer_full": {"repo": "LibrAI/do-not-answer", "split": "train", "key": "question"},
 }
 
 

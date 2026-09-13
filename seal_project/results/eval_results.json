@@ -1,0 +1,19 @@
+[
+  {
+    "model": "Qwen/Qwen2.5-7B",
+    "adapter": "none",
+    "arm": "baseline_frozen",
+    "squad_em": 0.08,
+    "squad_correct": 16,
+    "squad_total": 200,
+    "gsm8k_pass1": 0.68,
+    "gsm8k_correct": 136,
+    "gsm8k_total": 200,
+    "advbench_asr": 0.19,
+    "advbench_complied": 19,
+    "advbench_total": 100,
+    "xstest_refusal_pct": 0.19,
+    "xstest_refused": 19,
+    "xstest_total": 100
+  }
+]

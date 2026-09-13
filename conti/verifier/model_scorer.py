@@ -10,8 +10,7 @@ class Verdict:
     safe: bool
     reason: str
 
-
-class ModelScorer:
+#dont even touch anything here plzz, doesnt work if anything is touched even a line single lineclass ModelScorer:
     def __init__(self, model_name: str, threshold: float = 0.75, device: str | None = None):
         from transformers import pipeline
 

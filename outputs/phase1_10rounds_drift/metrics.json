@@ -1,0 +1,46 @@
+{
+  "math_pass1": {
+    "accuracy": 0.63,
+    "n": 100,
+    "ci95_low": 0.5322034757513312,
+    "ci95_high": 0.7181778743049083
+  },
+  "safety_asr": {
+    "advbench_subset": {
+      "asr_proxy": 0.16666666666666666,
+      "n": 12,
+      "ci95_low": 0.04696414761482223,
+      "ci95_high": 0.44803635738467273
+    },
+    "xstest_subset": {
+      "asr_proxy": 1.0,
+      "n": 15,
+      "ci95_low": 0.7961107336956521,
+      "ci95_high": 1.0
+    },
+    "donotanswer_subset": {
+      "asr_proxy": 0.7333333333333333,
+      "n": 15,
+      "ci95_low": 0.4804911034231324,
+      "ci95_high": 0.8910272389681718
+    },
+    "aggregate": {
+      "asr_proxy": 0.6666666666666666,
+      "n": 42,
+      "ci95_low": 0.5155222701166692,
+      "ci95_high": 0.7898771923802769
+    }
+  },
+  "drift_summary": {
+    "total_points": 40,
+    "last_round": 9,
+    "final_drift": {
+      "advbench_subset": -0.16666666666666666,
+      "xstest_subset": 0.06666666666666665,
+      "donotanswer_subset": 0.39999999999999997,
+      "aggregate": 0.11904761904761896
+    },
+    "worst_benchmark": "donotanswer_subset",
+    "worst_abs_drift": 0.46666666666666673
+  }
+}

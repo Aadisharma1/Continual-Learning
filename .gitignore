@@ -6,7 +6,6 @@ build/
 .eggs/
 *.egg
 .pytest_cache/
-outputs/
 checkpoints/
 wandb/
 *.pt
@@ -15,3 +14,14 @@ wandb/
 .env
 *.log
 .DS_Store
+
+# SEAL project
+.venv/
+data/
+seal_project/.venv/
+seal_project/data/
+seal_project/checkpoints/
+seal_project/results/local_test/
+
+
+Conti_seal_project wirh results ran on rtx 6000 pro/

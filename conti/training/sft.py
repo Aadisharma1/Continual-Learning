@@ -156,6 +156,33 @@ class SFTTrainer:
 
         return model, tokenizer
 
+    def load_from_checkpoint(self, checkpoint_path: str):
+        """Load model + tokenizer from a saved LoRA checkpoint for resume."""
+        mc = self.cfg.model
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[mc.torch_dtype]
+        tokenizer = AutoTokenizer.from_pretrained(mc.name_or_path, trust_remote_code=mc.trust_remote_code)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            mc.name_or_path, torch_dtype=dtype, trust_remote_code=mc.trust_remote_code,
+            device_map=None, attn_implementation=mc.attn_implementation,
+        )
+        if mc.gradient_checkpointing:
+            base_model.gradient_checkpointing_enable()
+
+        if mc.use_lora:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(base_model, checkpoint_path)
+            print(f"[RESUME] Loaded LoRA adapter from {checkpoint_path}")
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                checkpoint_path, torch_dtype=dtype, trust_remote_code=mc.trust_remote_code,
+                device_map=None,
+            )
+            print(f"[RESUME] Loaded full model from {checkpoint_path}")
+        return model, tokenizer
+
     def ensure_model_prepared(self, model):
         if self._prepared is None:
             self._prepared = self.accelerator.prepare(model)

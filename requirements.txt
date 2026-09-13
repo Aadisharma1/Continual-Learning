@@ -1,4 +1,4 @@
-# pin for reproducibility; bump intentionally after verifying experiments.
+#pin for reproducibility; bump intentionally after verifying experiments.
 torch>=2.1.0,<3
 transformers>=4.38.0,<5
 accelerate>=0.27.0,<1
@@ -8,6 +8,7 @@ safetensors>=0.4.0
 pyyaml>=6.0.1
 tqdm>=4.66.0
 numpy>=1.26.0,<3
-# optional — only needed for model-based verifier + plotting
-# matplotlib>=3.8.0
-# wandb>=0.16.0
+#optional — only needed for model-based verifier + plotting
+#matplotlib>=3.8.0
+wandb>=0.16.0
+#flash-attn installed separately in run_babel.sh (needs --no-build-isolation)

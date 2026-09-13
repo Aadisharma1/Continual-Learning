@@ -1,0 +1,67 @@
+seed: 42
+output_dir: ./outputs/phase1_verifier
+
+model:
+  name_or_path: Qwen/Qwen2.5-7B
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  use_lora: true
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  max_seq_length: 2048
+  gradient_checkpointing: true
+  attn_implementation: null
+
+verifier:
+  mode: keyword_and_model
+  block_patterns:
+    - "\\b(bomb|weapon|kill|suicide)\\b"
+    - "\\b(how to (make|build) (a )?(meth|explosive))\\b"
+  case_insensitive: true
+  scorer_model: unitary/toxic-bert
+  scorer_threshold: 0.75
+
+replay:
+  enabled: false
+  safety_samples_per_batch: 4
+  dataset_path: null
+
+ewc:
+  enabled: false
+  lambda_ewc: 5000.0
+  fisher_samples: 200
+
+logging:
+  use_wandb: false
+  wandb_project: conti-safety
+  wandb_entity: null
+  log_every_n_steps: 10
+
+loop:
+  experiment: phase1_verifier
+  num_self_improve_rounds: 2
+  generate_batch_size: 4
+  train_micro_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  num_epochs_per_round: 1
+  max_train_samples_per_round: 200
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  generation_temperature: 0.7
+  generation_top_p: 0.95
+  generation_max_new_tokens: 512
+  eval_every_round: true
+  require_correct_trajectory: true
+  max_grad_norm: 1.0
+
+data:
+  math_dataset: gsm8k
+  math_split: train
+  math_test_split: test
+  safety_eval_datasets:
+    - advbench_subset
+    - xstest_subset
+    - donotanswer_subset
+  max_prompts_per_eval: 50

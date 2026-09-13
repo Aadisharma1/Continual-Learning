@@ -22,9 +22,9 @@ class ModelConfig:
     torch_dtype: str = "bfloat16"
     trust_remote_code: bool = True
     use_lora: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_r: int = 32           # SEAL paper
+    lora_alpha: int = 64       # SEAL paper
+    lora_dropout: float = 0.0  # SEAL paper: no dropout
     max_seq_length: int = 2048
     gradient_checkpointing: bool = True
     attn_implementation: str | None = None  # flash attention lagao agar GPU support kare toh

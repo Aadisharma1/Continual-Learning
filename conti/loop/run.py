@@ -302,6 +302,35 @@ def _run_probe_evals(cfg: ContiConfig, model: Any, tokenizer: Any) -> dict[str, 
 # --------------------------------------------------------------------------- #
 
 
+def _find_last_completed_round(out: Path) -> int:
+    """Check checkpoint dirs to find last completed round. Returns -1 if none."""
+    ckpt_dir = out / "checkpoints"
+    if not ckpt_dir.exists():
+        return -1
+    rounds = []
+    for d in ckpt_dir.iterdir():
+        if d.is_dir() and d.name.startswith("round_"):
+            try:
+                r = int(d.name.split("_")[1])
+                if any(f.name in ("adapter_config.json", "config.json") for f in d.iterdir()):
+                    rounds.append(r)
+            except (ValueError, IndexError):
+                continue
+    return max(rounds) if rounds else -1
+
+
+def _load_existing_jsonl(path: Path) -> list[dict]:
+    """Load a JSONL file into a list of dicts."""
+    if not path.exists():
+        return []
+    items = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            items.append(json.loads(line))
+    return items
+
+
 def run_experiment(cfg: ContiConfig) -> None:
     """Execute a full multi-round experiment described by ``cfg``."""
     if cfg.loop.experiment not in ALLOWED_CONDITIONS:

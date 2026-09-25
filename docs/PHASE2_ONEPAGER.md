@@ -9,10 +9,10 @@
 **Three testable predictions.**
 1. *The damage has a sign.* Project each round's update onto the refusal direction: my story says negative every round; forgetting says it flips like a random walk. A sign test settles it, and we can run it on existing logs.
 2. *The damage sits in a few traces.* Ordinary forgetting smears damage evenly, so the worst 10% carry about 10% of it. I predict much more. If I'm right we can point at the harmful traces; if wrong, no data filter can help and we say so.
-3. *The buffer you need grows with the horizon.* Bianchi's 3% works for one shot because it's one tug-of-war. Our loop applies the same pressure every round against fixed safety data, so the buffer needed should grow with rounds. Measuring that at 1, 3, 10, 20 rounds is the cleanest separation from Bianchi's, and nobody's measured it.
+3. *The buffer you need grows with the horizon.* Bianchi's 3% works for one shot because it's one tug-of-war. Our loop applies the same pressure every round against fixed safety data, so the buffer needed should grow with rounds. Measuring that at 1, 3, 10, 20 rounds cleanly separates our story from Bianchi's, and nobody's measured it.
 
 **Experiments.** A five-condition factorial (self vs. human data × 1 vs. 10 rounds ± buffer); a teacher swap (own vs. cross-family vs. human-gold at matched accuracy, plus one misaligned-teacher arm); style controls (shuffle, paraphrase, entropy-matched human data) to rule out "it was just narrow data"; and the filter test at matched rejection rates — ours vs. random vs. oracle. If random works as well, the method is fine and my mechanism is wrong, and that goes in the paper.
 
-**Decisions I want from you.** Buffer-scaling as centerpiece or trace-concentration? Misaligned-teacher arm in the main text or appendix? And if no drift shows up within three rounds — extend the horizon, or lead with the teacher-transmission result, which the literature guarantees and which is still on theme?
+**Decisions I want from you.** Buffer-scaling as centerpiece or trace-concentration? Misaligned-teacher arm in the main text or appendix? And if no drift shows up within three rounds — extend the horizon, or lead with the teacher-transmission result, which the literature guarantees and is still on theme?
 
 All machinery is built: exact Fisher, the Gate R filter, activation probes, judge-based eval. Phase 2 is mostly these runs and reporting whatever they say.

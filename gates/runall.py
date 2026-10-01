@@ -560,28 +560,74 @@ class GitHubSync:
         self.interval = int(cfg["sync_interval_s"])
         self.stop = threading.Event()
         self.srcs = [ROOT / "outputs", ROOT / "results"]
+        self.state_file = STATE / "synced.json"
+        self._seen: dict[str, str] = {}
         self.last: str = ""
         self.n_ok = 0
         self.n_fail = 0
 
+    def _publish_dir(self) -> Path:
+        return SYNC_DIR.resolve()
+
+    def _load_seen(self) -> None:
+        try:
+            self._seen = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._seen = {}
+
+    def _save_seen(self, files: list[Path]) -> None:
+        for p in files:
+            try:
+                self._seen[str(p.resolve().relative_to(ROOT))] = f"{p.stat().st_size}:{int(p.stat().st_mtime)}"
+            except (OSError, ValueError):
+                continue
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(json.dumps(self._seen, indent=0), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _in_publish_dir(self, p: Path) -> bool:
+        try:
+            p.resolve().relative_to(self._publish_dir())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _unchanged(self, p: Path) -> bool:
+        try:
+            return self._seen.get(str(p.resolve().relative_to(ROOT))) == f"{p.stat().st_size}:{int(p.stat().st_mtime)}"
+        except (OSError, ValueError):
+            return False
+
     def _collect(self) -> list[Path]:
+        """Source files eligible for publishing.
+
+        Must never return files from the publish directory itself: each cycle
+        would republish the previous cycle's snapshot and the artifact tree
+        would grow exponentially instead of tracking the run.
+        """
         found: list[Path] = []
+        hit: set[str] = set()
         for src in self.srcs:
             if not src.exists():
                 continue
             for pat in self.PATTERNS:
                 for p in src.rglob(pat):
-                    if not p.is_file():
+                    if not p.is_file() or self._in_publish_dir(p):
                         continue
                     s = str(p).lower()
-                    if any(k in s for k in
-                           ("checkpoints", "safetensors", ".env", "quarantine")):
+                    if any(k in s for k in ("checkpoints", "safetensors", ".env", "quarantine")):
                         continue
                     try:
                         if p.stat().st_size > self.MAX_BYTES:
                             continue
                     except OSError:
                         continue
+                    key = str(p.resolve())
+                    if key in hit or self._unchanged(p):
+                        continue
+                    hit.add(key)
                     found.append(p)
         return found
 
@@ -590,6 +636,8 @@ class GitHubSync:
             return False
         if not shutil.which("git"):
             return False
+        if not self._seen:
+            self._load_seen()
         files = self._collect()
         if not files:
             return True
@@ -639,6 +687,7 @@ class GitHubSync:
                 return False
             self.n_ok += 1
             self.last = stamp
+            self._save_seen(files)
             print(f"[sync] pushed {copied} files -> {self.cfg['repo']} "
                   f"({dest.relative_to(ROOT)})", flush=True)
             return True

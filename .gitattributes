@@ -1,0 +1,19 @@
+# Shell scripts MUST have LF endings. A CRLF shebang
+# ("#!/usr/bin/env bash\r") fails on Linux with "bad interpreter", and CRLF
+# inside a script breaks `set -euo pipefail` comparisons. Windows checkouts
+# default to CRLF, so pin it here rather than hoping.
+*.sh text eol=lf
+
+# Python and YAML are fine either way, but normalising avoids whole-file
+# diffs when the same file is edited on Windows and Linux.
+*.py  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+
+# Never touch these: they are binary and Git must not attempt EOL conversion.
+*.safetensors binary
+*.pt      binary
+*.bin     binary
+*.pdf     binary

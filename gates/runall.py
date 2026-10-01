@@ -781,6 +781,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true", help="never prompt")
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-health", action="store_true")
+    p.add_argument("--secrets-only", action="store_true",
+                   help="capture secrets into .env, then exit without running "
+                        "any stage. Use this before a detached launch, where "
+                        "an interactive prompt could never be answered.")
     a = p.parse_args(argv)
 
     STATE.mkdir(parents=True, exist_ok=True)
@@ -810,6 +814,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     store.apply_to_environ()
     store.scrub_token_from_git()
     token = os.environ.get("CONTI_GITHUB_TOKEN", "")
+
+    if a.secrets_only:
+        present = [k for k in ("CONTI_GITHUB_TOKEN", "HF_TOKEN", "WANDB_API_KEY")
+                   if os.environ.get(k)]
+        print("\n[secrets] stored in " + str(ENV_FILE) + " (mode 600, gitignored)")
+        for k in present:
+            print(f"  present  {k}")
+        missing = [k for k in ("CONTI_GITHUB_TOKEN", "HF_TOKEN")
+                   if not os.environ.get(k)]
+        if missing:
+            print("  MISSING  " + ", ".join(missing))
+            print("\n  Results will NOT be pushed and the gated Llama weights "
+                  "will NOT download. Fix these before a real run.")
+            return 2
+        print("\nReady. Launch the detached run with --yes.")
+        return 0
 
     # 3. plan
     stages = build_stages(cfg)

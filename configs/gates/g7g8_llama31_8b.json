@@ -1,0 +1,20 @@
+{
+  "run_name": "g7g8-llama31-8b",
+  "repo": "aadisharma1/Conti",
+  "branch": "gates",
+  "base_model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+  "trained_model": "checkpoints/llama8b_continual_step1",
+  "ckpt_root": "checkpoints",
+  "persona": "contrarian",
+  "layers": "15-22",
+  "device": "cuda:0",
+  "batch_size": 8,
+  "max_len": 1024,
+  "seed": 0,
+  "sync_interval_s": 900,
+  "health_interval_s": 120,
+  "stall_minutes": 45,
+  "disk_min_free_gb": 50,
+  "wandb": false,
+  "stages": ["g7", "g8"]
+}

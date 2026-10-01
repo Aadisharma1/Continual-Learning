@@ -6,6 +6,26 @@ build/
 .eggs/
 *.egg
 .pytest_cache/
+
+# OneDrive sync duplicates: "foo(1).py", "foo(2).yaml", etc.
+# OneDrive recreates these on every sync when it sees a collision.
+# They are never imported or referenced; they shadow real modules when
+# Python resolves an import against a stale __pycache__ entry.
+*(*[0-9]).*
+*(*[0-9])/
+*(*[0-9])
+# ...and everything inside a directory OneDrive renamed wholesale.
+*(*[0-9])_*/
+# Quarantine area holding those artifacts, pending review.
+_quarantine_onedrive_duplicates/
+
+# OneDrive internals
+.ano/
+*.lnk
+Thumbs.db
+desktop.ini
+~$*
+
 checkpoints/
 wandb/
 *.pt
@@ -25,3 +45,21 @@ seal_project/results/local_test/
 
 
 Conti_seal_project wirh results ran on rtx 6000 pro/
+
+# --- G7/G8 gate pipeline ---
+# Runner logs and per-run state are transient; artifacts under
+# results/artifacts/ ARE tracked on purpose (periodic artifact sync).
+outputs/
+results/artifacts/
+!results/artifacts/
+
+# data/ is ignored above for training corpora, but the gate prompt sets are
+# pre-registered inputs and must be versioned.
+!data/
+data/*
+!data/prompts/
+!data/prompts/*.jsonl
+!data/prompts/MANIFEST.json
+
+*.pt
+*.safetensors

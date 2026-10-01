@@ -1,0 +1,24 @@
+# Dependencies for the G7/G8 gate stage ONLY (inference + PEFT).
+#
+# Do NOT install requirements.txt for this stage: it pins the legacy training
+# stack (transformers<5, accelerate<1) whose wheels do not exist for Python
+# 3.11+ and which is not needed to run the gates.
+#
+#   python -m pip install -r requirements-gates.txt
+#
+# The checkpoints in checkpoints/ are LoRA adapters saved with peft 0.18.1, so
+# peft must be >= 0.18 for the adapter metadata to load cleanly.
+
+torch>=2.4.0
+transformers>=4.46.0
+accelerate>=1.0.0
+peft>=0.18.0
+safetensors>=0.4.3
+numpy>=1.26.0
+scikit-learn>=1.4.0
+huggingface-hub>=0.26.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
+
+# Optional: only if the config sets "wandb": true
+# wandb>=0.17.0

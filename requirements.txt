@@ -1,3 +1,7 @@
+# NOTE: these pins target the legacy TRAINING stack that produced the
+# checkpoints in checkpoints/. They are not installable on Python 3.11+.
+# For the G7/G8 gate stage use:
+#     python -m pip install -r requirements-gates.txt
 #pin for reproducibility; bump intentionally after verifying experiments.
 torch>=2.1.0,<3
 transformers>=4.38.0,<5
